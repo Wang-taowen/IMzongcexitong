@@ -118,6 +118,13 @@
 --     以免阻塞整学年公示，publish_year 空分提示改为准确的测评档案口径；F2 calculation_input 计入 completed 表单
 --     （公示后视图不再误显示 0；void 作废仍不计加分，属既定口径）；F3 规则匹配增加 effective_on <= UTC_DATE()。
 --   3NF（N1）：assessment_project.category 由 rule_key 函数决定（传递依赖），改为 VIRTUAL 生成列（与 component 同口径）。
+-- 完整性收尾 v13（2026-11-27，在 v12 基础上仅补三处硬约束，不改任何表结构与结果集列名）：
+--   N2 rule_key 白名单 CHECK：component/category 两个生成列的唯一输入必须合法；
+--     否则拼错键会被 CASE 的 ELSE 静默归为 B2/学术科研，错误归类且应用层毫无察觉。
+--   S5 公示校验码纳入 a.class_id：public_notice 与 published_results 都展示班级，
+--     公示后改班级快照必须让 verify_publication 显示 intact=0（与已覆盖的 grade_year 同口径）。
+--   C3 component_score 补 BEFORE UPDATE 封顶触发器：原 INSERT-only 触发器拦不住
+--     公示后直接 UPDATE 改 A/B1 分数绕过规则满分，UPDATE 同样按该生该年规则校验。
 CREATE DATABASE student_assessment CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci;
 USE student_assessment;
 
@@ -190,6 +197,10 @@ CREATE TABLE assessment_project (
     evidence_requirement VARCHAR(255) NULL,
     CHECK (score_cap > 0 AND (total_cap IS NULL OR total_cap > 0)
            AND (max_items IS NULL OR max_items > 0) AND evidence_required IN (0,1)),
+    -- v13 N2：rule_key 是 component/category 两个生成列的唯一输入，必须限定在
+    -- 已定义映射的 8 个键内；未列入的键会被 CASE ELSE 静默归为 B2/学术科研。
+    CHECK (rule_key IN ('paper','book','project','competition','ip',
+                        'social_work','volunteer','practice')),
     UNIQUE (rule_id, project_name),
     KEY (rule_id, component),
     FOREIGN KEY (rule_id) REFERENCES assessment_rule(rule_id)
@@ -1331,9 +1342,11 @@ GROUP BY a.student_id, a.year_id, a.rule_id, a.a_score, a.b1_input, ar.b1_formul
 DELIMITER $$
 
 -- 内部过程：对某学年公示批次的全部结果计算 SHA-256 摘要。
--- 摘要覆盖 学年|批次时刻|每个学生的(学号:总分:名次:入学年:A不合格:学业不合格:优秀比例:各组件(组件:分))。
+-- 摘要覆盖 学年|批次时刻|每个学生的(学号:总分:名次:入学年:班级:A不合格:学业不合格:优秀比例:各组件(组件:分))。
 -- 除冻结的total_score/rank_no/组件分，还纳入等级评定输入(grade_year/a_failed/academic_failed/excellent_ratio)，
 -- 因为 grade 在 result_with_rank 中按这些输入实时重算；任何一处事后改动都会使 verify_publication 重算结果与落盘校验码不一致。
+-- v13 S5：再纳入 a.class_id —— 实名公示 public_notice 与匿名 published_results 都按班级展示，
+-- 公示后改班级快照会改变公示内容，因此也必须破坏校验码（与 grade_year 同口径）。
 CREATE PROCEDURE calc_publication_digest(
     IN p_year VARCHAR(24), IN p_batch DATETIME(6), OUT p_digest CHAR(64)
 )
@@ -1345,7 +1358,8 @@ BEGIN
         COALESCE((
             SELECT GROUP_CONCAT(
                 CONCAT(r.student_id, ':', r.total_score, ':', rk.rank_no, ':',
-                       s.grade_year, ':', a.a_failed, ':', a.academic_failed, ':', ar.excellent_ratio, ':',
+                       s.grade_year, ':', a.class_id, ':',
+                       a.a_failed, ':', a.academic_failed, ':', ar.excellent_ratio, ':',
                        COALESCE((SELECT GROUP_CONCAT(
                                     CONCAT(cs.component, ':', cs.score)
                                     ORDER BY FIELD(cs.component, 'A','B1','B2','C') SEPARATOR ',')
@@ -1911,6 +1925,27 @@ END$$
 -- A/B1 分项满分随规则 a_cap/b1_cap 变化，CHECK 无法跨表取规则，故由本触发器按规则校验。
 -- 经 result_id→assessment_result→student_year_assessment→assessment_rule 取该生该年所用规则的满分。
 CREATE TRIGGER check_component_cap_ins BEFORE INSERT ON component_score FOR EACH ROW
+BEGIN
+    DECLARE v_a_cap, v_b1_cap DECIMAL(5,2);
+    IF NEW.component IN ('A','B1') THEN
+        SELECT ar.a_cap, ar.b1_cap INTO v_a_cap, v_b1_cap
+        FROM assessment_result r
+        JOIN student_year_assessment a ON a.student_id = r.student_id AND a.year_id = r.year_id
+        JOIN assessment_rule ar ON ar.rule_id = a.rule_id
+        WHERE r.result_id = NEW.result_id;
+        IF NEW.component = 'A' AND NEW.score > v_a_cap THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '基本素质A超过规则满分';
+        END IF;
+        IF NEW.component = 'B1' AND NEW.score > v_b1_cap THEN
+            SIGNAL SQLSTATE '45000' SET MESSAGE_TEXT = '学业成绩B1超过规则满分';
+        END IF;
+    END IF;
+END$$
+
+-- v13 C3：补 BEFORE UPDATE 同口径封顶校验。公示冻结分项若被直接 UPDATE 改分，
+-- 原 INSERT-only 触发器不会拦截，可绕过规则满分约束；UPDATE 同样按 NEW.result_id
+-- 对应学生该学年的规则取 a_cap/b1_cap 校验（若同时改了 result_id，按改后归属校验）。
+CREATE TRIGGER check_component_cap_upd BEFORE UPDATE ON component_score FOR EACH ROW
 BEGIN
     DECLARE v_a_cap, v_b1_cap DECIMAL(5,2);
     IF NEW.component IN ('A','B1') THEN
